@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -219,10 +220,10 @@ def build_con_J_hard_overlap(j_vals, j_mask, tol:float = 0.1):
 
     return con_J
 
-def collate128(batch, K_max=4, num_j=3):
+def collate128(batch, K_max=4, num_j=3, noise_std=0.10):
     B = len(batch)
     P_max = max(s["mix_peaks"].shape[0] for s in batch)   # max number of peaks per batch
-    
+
     masks = torch.zeros(B, P_max, dtype=torch.bool)
     cons = torch.zeros(B, P_max, P_max, dtype=torch.float32)
     n_components = torch.zeros(B, dtype=torch.long)
@@ -231,23 +232,25 @@ def collate128(batch, K_max=4, num_j=3):
     mix_integrals = torch.zeros(B, P_max, dtype=torch.float32)
     j_vals = torch.zeros(B, P_max, num_j, dtype=torch.float32)
     j_mask = torch.zeros(B, P_max, num_j, dtype=torch.bool)
+    proportions = torch.zeros(B, K_max, dtype=torch.float32)
     smiles = []
+    solvents = []
+    frequencies = []
 
     for i, sample in enumerate(batch):
-        mixture = sample["mix_peaks"]  
-        target = sample["target"] 
-        s = sample["smiles"]
+        mixture = sample["mix_peaks"]
+        target = sample["target"]
         P_i = mixture.shape[0]
         mix_peaks[i, :P_i] = mixture
-        mix_integrals[i, :P_i] = sample["mix_integrals"]
-
-        noise = torch.randn(P_i) * 0.10     # 10% std
-        mix_integrals[i, :P_i] *= (1.0 + noise)
+        integ = torch.as_tensor(sample["mix_integrals"], dtype=torch.float32)
+        if noise_std > 0:
+            integ = integ * (1.0 + torch.randn(P_i) * noise_std)
+        mix_integrals[i, :P_i] = integ
         masks[i, :P_i] = True
 
         if "j_vals" in sample and "j_mask" in sample:
-            J = torch.as_tensor(sample["j_vals"], dtype=torch.float32)      
-            M = torch.as_tensor(sample["j_mask"], dtype=torch.bool)       
+            J = torch.as_tensor(sample["j_vals"], dtype=torch.float32)
+            M = torch.as_tensor(sample["j_mask"], dtype=torch.bool)
             j_vals[i, :P_i, :] = J
             j_mask[i, :P_i, :] = M
 
@@ -259,21 +262,36 @@ def collate128(batch, K_max=4, num_j=3):
             s = [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else x for x in s]
         smiles.append(s)
 
-        # Handle con matrix (P_i x P_i)
-        if "con" in sample and sample["con"] is not None:
-            con = sample["con"]
-            cons[i, :P_i, :P_i] = con
+        # con matrix (P_i x P_i): use precomputed if given, else derive from the same
+        # (possibly noisy) integrals used above, so con and mix_integrals share one noise draw
+        if sample.get("con") is not None:
+            cons[i, :P_i, :P_i] = sample["con"]
+        else:
+            a = integ.unsqueeze(0)
+            b = integ.unsqueeze(1)
+            ratio = torch.minimum(a, b) / torch.maximum(a, b).clamp_min(1e-9)
+            ratio = torch.where((a == 0) | (b == 0), torch.zeros_like(ratio), ratio)
+            ratio.fill_diagonal_(1.0)
+            cons[i, :P_i, :P_i] = ratio
 
         targets_padded[i, :P_i] = target
         n_components[i] = sample["n_components"]
 
+        scales = sample.get("scales")
+        if scales is not None:
+            n = min(len(scales), K_max)
+            proportions[i, :n] = torch.as_tensor(scales[:n], dtype=torch.float32)
+
+        solvents.append(sample.get("solvent"))
+        frequencies.append(sample.get("frequency"))
+
     conj = build_con_J_hard_overlap(j_vals, j_mask, tol=0.1)
 
-    # Pad n_components to K_max=4
+    # Pad n_components to K_max
     component_mask = torch.zeros(B, K_max, dtype=torch.bool)
     for i, n in enumerate(n_components):
         component_mask[i, :n] = True
-        
+
     return {
         "mask": masks,               # (B, P_max)
         "mix_peaks": mix_peaks,               # (B, P_max)
@@ -285,61 +303,91 @@ def collate128(batch, K_max=4, num_j=3):
         'smiles': smiles,
         "j_vals": j_vals,       #(B, P_max, num_j(3))
         "j_mask": j_mask,        #(B, P_max, num_j(3))
-        "con_J": conj            #(B,P_max, P_max)
+        "con_J": conj,            #(B,P_max, P_max)
+        "proportions": proportions,  # (B, K_max)
+        "solvent": solvents,
+        "frequency": frequencies,
     }
 
 
-def slot_hungarian_loss(slot_attn, targets, mask, K, gamma, alpha):
+def slot_hungarian_loss(slot_attn, targets, mask, K):
     """
     slot_attn: (B, K, P)
     targets:   (B, P)
-    mask:      (B, P) 
+    mask:      (B, P)
+
+    Same semantics as a per-sample Hungarian-matched cross-entropy, but built to avoid
+    a GPU<->CPU sync per sample: the original nested Python loop called .item()/.cpu()
+    up to B times per batch, which dominates wall-clock time far more than the model's
+    actual compute (each sync blocks until the whole CUDA queue drains).
     """
     B, K_pred, P = slot_attn.shape
     assert K_pred == K
+    device = slot_attn.device
+    mask_bool = mask.bool()
 
-    total_loss = 0.0
-    total_peaks = 0 
-    mapping = torch.full((B, K), -1, dtype=torch.long, device=slot_attn.device)
+    # one sync for the whole batch instead of one per sample
+    targets_masked = targets.masked_fill(~mask_bool, -1)
+    n_true_list = (targets_masked.amax(dim=1) + 1).clamp(min=1, max=K).cpu().tolist()
+    total_peaks = int(mask_bool.sum().item())
 
+    log_attn = torch.log(slot_attn + 1e-9)  # (B, K, P)
+
+    BIG = 1e6
+    cost_padded = torch.full((B, K, K), BIG, device=device)
     for b in range(B):
-        # unmasking
-        valid = mask[b]          # (P,)
-        attn_b = slot_attn[b, :, valid]     # (K, P_valid)
-        tgt_b = targets[b, valid]           # (P_valid,)
-        n_true = tgt_b.max().item() + 1     # check highest value in targets (max components)
-        n_true = min(n_true, K)             # ensure ≤ K
+        n_true = n_true_list[b]
+        valid = mask_bool[b]
+        tgt_b = targets[b, valid]
+        onehot = F.one_hot(tgt_b, num_classes=n_true).float()  # (P_valid, n_true)
+        counts = onehot.sum(dim=0).clamp_min(1.0)               # (n_true,)
+        cost = -(log_attn[b, :, valid] @ onehot) / counts       # (K, n_true), mean over peaks per (slot,true) pair
+        cost_padded[b, :, :n_true] = cost
 
-        cost = torch.zeros(K, n_true, device=slot_attn.device)
+    # one device->host sync for the whole batch's cost matrices, not one per sample
+    cost_np = cost_padded.detach().cpu().numpy()
 
-        for pred_slot in range(K):
-            for true_slot in range(n_true):
-                peak_mask = (tgt_b == true_slot) 
+    mapping_np = -np.ones((B, K), dtype=np.int64)      # slot -> true component
+    inv_mapping_np = np.zeros((B, K), dtype=np.int64)  # true component -> slot
+    for b in range(B):
+        n_true = n_true_list[b]
+        row_ind, col_ind = linear_sum_assignment(cost_np[b, :, :n_true])  # pure CPU/numpy, no GPU sync
+        mapping_np[b, row_ind] = col_ind
+        inv_mapping_np[b, col_ind] = row_ind
 
-                if peak_mask.sum() == 0:
-                    continue
+    mapping = torch.from_numpy(mapping_np).to(device)
+    inv_mapping = torch.from_numpy(inv_mapping_np).to(device)
 
-                probs = attn_b[pred_slot, peak_mask]  
-                log_probs = torch.log(probs + 1e-9)
-                cost[pred_slot, true_slot] = -log_probs.mean() ##mean over peaks
+    assigned_slot = torch.gather(inv_mapping, 1, targets.clamp_min(0))              # (B, P)
+    p_correct = torch.gather(slot_attn, 1, assigned_slot.unsqueeze(1)).squeeze(1)    # (B, P)
+    p_correct = p_correct.clamp_min(1e-9)
 
-    
-        cost_np = cost.detach().cpu().numpy() 
-        row_ind, col_ind = linear_sum_assignment(cost_np) ## hungarian matching
+    loss = (-torch.log(p_correct))[mask_bool].sum() / max(total_peaks, 1)
+    return loss, mapping
 
-        ##realignment
-        aligned = torch.zeros(n_true, attn_b.shape[1], device=slot_attn.device)
-        for r, c in zip(row_ind, col_ind): 
-            aligned[c] = attn_b[r]  
-            mapping[b, r] = int(c)
 
-        idx = torch.arange(tgt_b.shape[0], device=slot_attn.device)
-        p_correct = aligned[tgt_b, idx].clamp_min(1e-9)
-        loss_b = (-torch.log(p_correct)).sum()
-        total_loss += loss_b
-        total_peaks += valid.sum().item()        
+def demo():
+    torch.manual_seed(0)
+    mask = torch.tensor([[True, True]])
+    targets = torch.tensor([[0, 1]])
 
-    return total_loss / max(total_peaks, 1), mapping 
+    # case 1: slots already aligned with true component order
+    slot_attn = torch.tensor([[[0.9, 0.1], [0.1, 0.9]]])
+    loss, mapping = slot_hungarian_loss(slot_attn, targets, mask, K=2)
+    assert torch.allclose(loss, -torch.log(torch.tensor(0.9)), atol=1e-4)
+    assert mapping.tolist() == [[0, 1]]
+
+    # case 2: slots swapped relative to true component order -- Hungarian must undo it
+    slot_attn = torch.tensor([[[0.1, 0.9], [0.9, 0.1]]])
+    loss, mapping = slot_hungarian_loss(slot_attn, targets, mask, K=2)
+    assert torch.allclose(loss, -torch.log(torch.tensor(0.9)), atol=1e-4)
+    assert mapping.tolist() == [[1, 0]]
+
+    print("slot_hungarian_loss self-check passed")
+
+
+if __name__ == "__main__":
+    demo()
 
 def entropy_regularization(slot_attn, mask):
     eps = 1e-9
