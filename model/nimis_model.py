@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -6,20 +7,24 @@ from einops import rearrange
 from scipy.optimize import linear_sum_assignment
 
 
-class ScalarEmbedding(nn.Module):  
-    def __init__(self, hidden_dim=64, out_dim=128):
+class ScalarEmbedding(nn.Module):
+    def __init__(self, hidden_dim=64, out_dim=128, n_freq=16, min_period=0.01, max_period=16.0):
         super().__init__()
+        # geometric periods in ppm: coarse (whole spectrum) down to ~0.01 ppm (resolves close peaks)
+        periods = torch.logspace(math.log10(max_period), math.log10(min_period), n_freq)
+        self.register_buffer("freqs", 2 * math.pi / periods)
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(2 * n_freq + 1, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim)
+            nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, pos, intensity):
-        scalars = torch.stack([pos, intensity], dim=-1)  # (B,P,2)
-        return self.net(scalars)                         # (B,P,out_dim)
+        ang = pos.unsqueeze(-1) * self.freqs                         # (B,P,F)
+        log_i = torch.log1p(intensity.clamp_min(0)).unsqueeze(-1)    # (B,P,1)
+        return self.net(torch.cat([ang.sin(), ang.cos(), log_i], dim=-1))  # (B,P,out_dim)
 
 
 class FeedForward(nn.Module):
@@ -36,7 +41,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class RatioAttention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.1):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.1, per_head_bias=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
@@ -48,8 +53,10 @@ class RatioAttention(nn.Module):
             nn.Linear(inner_dim, dim, bias=False),
             nn.Dropout(dropout),
         )
-        self.w_con = nn.Parameter(torch.tensor(1.0)) 
-        self.w_conJ = nn.Parameter(torch.tensor(1.0))
+        # per_head_bias: one learned weight per head instead of one shared scalar
+        shape = (heads,) if per_head_bias else ()
+        self.w_con = nn.Parameter(torch.ones(shape))
+        self.w_conJ = nn.Parameter(torch.ones(shape))
 
     def forward(self, x, con=None, mask=None, conj= None):
         """
@@ -64,12 +71,12 @@ class RatioAttention(nn.Module):
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (B, h, P, P)
         if con is not None:
-            con = con.unsqueeze(1).repeat(1, self.heads, 1, 1)
-            dots = dots + self.w_con * con
+            w = self.w_con.view(1, -1, 1, 1) if self.w_con.dim() else self.w_con
+            dots = dots + w * con.unsqueeze(1)
 
         if conj is not None:
-            conj = conj.unsqueeze(1).repeat(1, self.heads, 1, 1)
-            dots = dots + self.w_conJ * conj
+            w = self.w_conJ.view(1, -1, 1, 1) if self.w_conJ.dim() else self.w_conJ
+            dots = dots + w * conj.unsqueeze(1)
 
         # masking
         if mask is not None:
@@ -82,11 +89,11 @@ class RatioAttention(nn.Module):
         return self.to_out(out), attn
 
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, per_head_bias=False):
         super().__init__()
         self.layers = nn.ModuleList([
             nn.ModuleList([
-                RatioAttention(dim, heads=heads, dim_head=dim_head),
+                RatioAttention(dim, heads=heads, dim_head=dim_head, per_head_bias=per_head_bias),
                 FeedForward(dim, mlp_dim),
             ])
             for _ in range(depth)
@@ -168,13 +175,13 @@ class SlotAttention(nn.Module):
         return slots, attn
 
 class NMRPeakSlotAttn(nn.Module):
-    def __init__(self, dim=128, mlp_dim=512, depth=6, heads=8, dim_head=64, K=4, slot_iters=3):
+    def __init__(self, dim=128, mlp_dim=512, depth=6, heads=8, dim_head=64, K=4, slot_iters=3, per_head_bias=False):
 
         super().__init__()
         self.K = K
         self.embedding = ScalarEmbedding(hidden_dim =64, out_dim=dim)
         self.dropout =nn.Dropout(0.1)
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, per_head_bias)
         self.slot_attention = SlotAttention(num_slots=K, dim=dim, iters=slot_iters)
 
     def forward(self, peaks, integrals, con, mask=None, component_mask=None, conj=None):
