@@ -5,3 +5,12 @@ __pycache__/
 .env
 .venv/
 *.log
+# local artifacts
+data/
+model/*.pt
+model/*.png
+model/*.txt
+model/*.csv
+model/test_run_id_*/
+model/case_studies/
+model/wandb/

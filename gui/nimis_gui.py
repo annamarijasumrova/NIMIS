@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from model.nimis_model import NMRPeakSlotAttn
 
-MODEL_PATH = Path(__file__).resolve().parents[1] / "model" / "nimis_weights.pt"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "model" / "NMRexp_conJ_Slot_attn_16A_A_best.pt"
 MAX_COMPONENTS = 4
 J_TOL = 0.1
 DEVICE = "cpu"

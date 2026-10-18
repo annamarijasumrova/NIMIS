@@ -1,9 +1,0 @@
-torch
-numpy
-pandas
-streamlit
-einops
-scipy
-h5py
-rdkit
-pyarrow
