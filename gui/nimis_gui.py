@@ -148,16 +148,6 @@ def parsed_to_display_table(parsed):
 
     return pd.DataFrame(rows, dtype=float)
 
-def build_con_matrix(integrals):
-    integrals = np.asarray(integrals, dtype=np.float32)
-    eps = 1e-8
-
-    ratio = integrals[:, None] / (integrals[None, :] + eps)
-    ratio = np.where(ratio > 1.0, 1.0 / ratio, ratio)
-
-    return ratio.astype(np.float32)
-
-
 def build_conj_matrix(j_values, j_mask, tol=0.1):
     j_values = np.asarray(j_values, dtype=np.float32)
     j_mask = np.asarray(j_mask, dtype=bool)
@@ -200,7 +190,6 @@ def prepare_inputs(parsed, n_components):
     j_values = j_values[order]
     j_mask = j_mask[order]
 
-    con = build_con_matrix(peak_integrals)
     conj = build_conj_matrix(j_values, j_mask, tol=J_TOL)
 
     component_mask = torch.zeros(1, MAX_COMPONENTS, dtype=torch.bool)
@@ -209,7 +198,6 @@ def prepare_inputs(parsed, n_components):
     batch = {
         "peaks": torch.tensor(peak_positions).float().unsqueeze(0),
         "integrals": torch.tensor(remap_integrals(peak_integrals)).float().unsqueeze(0),
-        "con": torch.tensor(con).float().unsqueeze(0),
         "conj": torch.tensor(conj).float().unsqueeze(0),
         "mask": torch.ones(1, len(peak_positions), dtype=torch.bool),
         "component_mask": component_mask,
@@ -243,7 +231,7 @@ def run_prediction(model, batch):
         slots, slot_attn, peak_features, attn_maps = model(
             batch["peaks"],
             batch["integrals"],
-            batch["con"],
+            None,
             mask=batch["mask"],
             component_mask=batch["component_mask"],
             conj=batch["conj"])
@@ -261,7 +249,7 @@ input_mode = st.radio(
     ["Paste SI-style NMR string", "Enter peaks manually"],
     horizontal=True)
 
-n_components = st.selectbox("Choose number of mixture components from the drop-down menu", [2, 3, 4], index=2)
+n_components = st.selectbox("Choose number of mixture components from the drop-down menu", [2, 3, 4, 5], index=2)
 
 if input_mode == "Paste SI-style NMR string":
     nmr_text = st.text_area(
