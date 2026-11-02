@@ -96,6 +96,95 @@ def random_baseline_accuracy(mask, targets, n_components, rng):
     return _best_match_accuracy(pred_labels, tgt_v, n_components), n_peaks
 
 
+H_MAX = 9
+H_PENALTY = 0.05
+
+
+def _scale_cost(integrals, scale):
+    """Per-peak cost of explaining `integrals` as integer multiples of one component's per-H scale.
+
+    Within a component every integral is (number of H) * (component scale), so
+    integral/scale should be a small integer. The H_PENALTY term prefers the
+    explanation with the smallest proton counts, which stops scale/2, scale/3, ...
+    from always fitting equally well.
+    """
+    ratio = integrals / scale
+    h = np.clip(np.round(ratio), 1, H_MAX)
+    return np.abs(ratio - h) / h + H_PENALTY * h
+
+
+def _fit_scale(integrals):
+    candidates = (integrals[:, None] / np.arange(1, H_MAX + 1)).ravel()
+    cost = np.array([_scale_cost(integrals, c).mean() for c in candidates])
+    return float(candidates[np.argmin(cost)])
+
+
+def j_integral_labels(adj, integrals, n_components, use_j=True, leftover="integral", rng=None, n_refine=3):
+    """Cluster peaks into exactly n_components groups from J-couplings and integrals.
+
+    1. J seeds (use_j): connected components of the J-match graph with >=2 peaks are
+       probable same-component groups; the n_components largest become seed clusters
+       (their peaks are locked) and each gets a per-H integral scale from _fit_scale.
+    2. If fewer seeds than components, extra clusters start from the unassigned peak
+       worst explained by every existing scale (farthest-first).
+    3. Every remaining peak (e.g. singlets with no J) is assigned to the cluster whose
+       scale explains its integral best (leftover="integral"), or to a random cluster
+       (leftover="random", the J-only control); scales are then re-fit from the members
+       and the unlocked peaks reassigned, n_refine times.
+    """
+    n = len(integrals)
+    labels = np.full(n, -1)
+    locked = np.zeros(n, dtype=bool)
+    scales = []
+
+    if use_j:
+        _, comp = connected_components(adj, directed=False)
+        sizes = np.bincount(comp)
+        seed_ids = [c for c in np.argsort(-sizes) if sizes[c] >= 2][:n_components]
+        for k, c in enumerate(seed_ids):
+            members = comp == c
+            labels[members] = k
+            locked[members] = True
+            scales.append(_fit_scale(integrals[members]))
+
+    while len(scales) < n_components:
+        free = np.flatnonzero(labels < 0)
+        if free.size == 0:
+            scales.append(float(integrals.mean()))
+            continue
+        if scales:
+            cost = np.min([_scale_cost(integrals[free], s) for s in scales], axis=0)
+            pick = free[np.argmax(cost)]
+        else:
+            pick = free[np.argmax(integrals[free])]
+        labels[pick] = len(scales)
+        scales.append(float(integrals[pick]))
+
+    free = labels < 0
+    if leftover == "random":
+        labels[free] = rng.integers(0, n_components, size=int(free.sum()))
+        return labels
+
+    for _ in range(n_refine + 1):
+        cost = np.stack([_scale_cost(integrals, s) for s in scales], axis=1)
+        labels = np.where(locked, labels, cost.argmin(axis=1))
+        for k in range(n_components):
+            members = labels == k
+            if members.any():
+                scales[k] = _fit_scale(integrals[members])
+    return labels
+
+
+def j_integral_accuracy(adj, integrals, mask, targets, n_components, **kwargs):
+    valid = mask.bool().numpy()
+    n_peaks = int(valid.sum())
+    if n_peaks == 0:
+        return 0, 0
+    pred_labels = j_integral_labels(adj.numpy()[valid][:, valid], integrals.numpy()[valid].astype(np.float64),
+                                    n_components, **kwargs)
+    return _best_match_accuracy(pred_labels, targets.numpy()[valid], n_components), n_peaks
+
+
 def demo():
     mask = torch.tensor([True, True, True, True])
     targets = torch.tensor([0, 0, 1, 1])
@@ -113,6 +202,14 @@ def demo():
     rng = np.random.default_rng(0)
     correct, total = random_baseline_accuracy(mask, targets, n_components=2, rng=rng)
     assert total == 4 and 0 <= correct <= 4
+    integrals = torch.tensor([0.8, 2.4, 0.2, 0.4, 0.8, 0.6])
+    targets = torch.tensor([0, 0, 1, 1, 0, 1])
+    mask = torch.ones(6, dtype=torch.bool)
+    adj = torch.eye(6)
+    adj[0, 1] = adj[1, 0] = 1.0
+    adj[2, 3] = adj[3, 2] = 1.0
+    assert j_integral_accuracy(adj, integrals, mask, targets, 2) == (6, 6)
+    assert j_integral_accuracy(adj, integrals, mask, targets, 2, use_j=False)[1] == 6
     print("baselines self-check passed")
 
 
@@ -136,7 +233,8 @@ def main():
                          shuffle=False, collate_fn=collate_fn)
 
     rng = np.random.default_rng(args.seed)
-    totals = {"j_coupling_only": [0, 0], "position_only": [0, 0], "random_floor": [0, 0]}
+    totals = {"j_coupling_only": [0, 0], "j_coupling_k_clusters": [0, 0], "integral_only": [0, 0],
+              "j_plus_integral": [0, 0], "position_only": [0, 0], "random_floor": [0, 0]}
 
     for batch in loader:
         mask, targets, peaks = batch["mask"], batch["targets"], batch["mix_peaks"]
@@ -148,6 +246,14 @@ def main():
             c, n = cluster_accuracy(con_j[b], mask[b], targets[b], n_comp)
             totals["j_coupling_only"][0] += c
             totals["j_coupling_only"][1] += n
+
+            integ = batch["mix_integrals"][b]
+            for name, kwargs in (("j_coupling_k_clusters", {"leftover": "random", "rng": rng}),
+                                 ("integral_only", {"use_j": False}),
+                                 ("j_plus_integral", {})):
+                c, n = j_integral_accuracy(con_j[b], integ, mask[b], targets[b], n_comp, **kwargs)
+                totals[name][0] += c
+                totals[name][1] += n
 
             c, n = position_only_accuracy(peaks[b], mask[b], targets[b], n_comp)
             totals["position_only"][0] += c
