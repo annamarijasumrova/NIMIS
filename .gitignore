@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+.env
+.venv/
+*.log
+
+# datasets (large; see README for how to obtain / rebuild)
+data/
+
+# run outputs: checkpoints, assignment logs, plots, csvs
+outputs/
+wandb/
+
+# personal scratch / superseded versions
+archive/
+
+# model weights, except the released checkpoint
+*.pt
+!weights/nimis_final_weights.pt

@@ -1,0 +1,11 @@
+torch==2.8.0
+numpy==2.0.2
+pandas==2.3.3
+pyarrow==21.0.0
+scipy==1.13.1
+scikit-learn==1.6.1
+matplotlib==3.9.4
+einops==0.8.2
+rdkit==2025.9.2
+wandb==0.26.1
+streamlit==1.50.0
