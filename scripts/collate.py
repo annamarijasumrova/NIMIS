@@ -23,8 +23,7 @@ def build_con_J_hard_overlap(j_vals, j_mask, tol:float = 0.1):
 
     has_J = j_mask.any(dim=-1).float()
     con_J = con_J * has_J.unsqueeze(2) * has_J.unsqueeze(1)
-    for b in range(B):
-        con_J[b].fill_diagonal_(1.0 if has_J[b].any() else 0.0)
+    con_J.diagonal(dim1=1, dim2=2).fill_(1.0)
 
     return con_J
 

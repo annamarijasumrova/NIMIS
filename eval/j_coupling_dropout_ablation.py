@@ -48,27 +48,22 @@ def drop_con_J_matches(con_j, drop_frac, generator=None):
     return out
 
 
-def collate_with_j_dropout(batch, K_max, noise_std, drop_frac, generator):
-    out = collate128(batch, K_max=K_max, noise_std=noise_std)
-    out["con_J"] = drop_con_J_matches(out["con_J"], drop_frac, generator=generator)
-    return out
-
-
 @torch.no_grad()
-def evaluate_at_drop_frac(model, loader, device, K, drop_con=False, n_component_bins=(2, 3, 4, 5)):
+def evaluate_at_drop_frac(model, batches, device, K, drop_frac, seed, drop_con=False, n_component_bins=(2, 3, 4, 5)):
     """Returns (overall_acc, peak_match_rate, {n_components: acc})."""
     model.eval()
     correct = total = 0
     matched_weighted = n_valid_total = 0
     per_n = {c: [0, 0] for c in n_component_bins}
-    for batch in loader:
+    generator = torch.Generator().manual_seed(seed)
+    for batch in batches:
         con = None if drop_con else batch["con"].to(device)
         mask = batch["mask"].to(device)
         component_mask = batch["component_mask"].to(device)
         mix_peaks = batch["mix_peaks"].to(device)
         mix_integrals = batch["mix_integrals"].to(device)
         targets = batch["targets"].to(device)
-        conj = batch["con_J"].to(device)
+        conj = drop_con_J_matches(batch["con_J"], drop_frac, generator=generator).to(device)
         n_components = batch["n_components"].to(device)
 
         slots, slot_attn, _, _ = model(mix_peaks, mix_integrals, con, mask, component_mask, conj)
@@ -114,9 +109,9 @@ def demo():
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", type=Path, default=REPO_ROOT / "outputs/NMRexp_conJ_Slot_attn_10_best.pt",
-                    help="a checkpoint trained WITH conJ active (run 10 was trained with --drop-con, conJ intact)")
-    p.add_argument("--test-parquet", type=Path, default=REPO_ROOT / "data/test_molecule_up25_orig_1prct.parquet")
+    p.add_argument("--checkpoint", type=Path, default=REPO_ROOT / "weights/nimis_final_weights.pt",
+                    help="a checkpoint trained WITH conJ active (the final weights were trained with --drop-con, conJ intact)")
+    p.add_argument("--test-parquet", type=Path, default=REPO_ROOT / "data/test_molecule_up25_orig_1prct_clean.parquet")
     p.add_argument("--drop-fracs", type=str, default="0.0,0.1,0.25,0.5,0.75,1.0")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--noise-std", type=float, default=0.1)
@@ -128,7 +123,7 @@ def main():
     p.add_argument("--dim-head", type=int, default=64)
     p.add_argument("--slot-iters", type=int, default=5)
     p.add_argument("--drop-con", action="store_true", default=True,
-                    help="must match how the checkpoint was trained (run 10 used --drop-con); pass --no-drop-con to disable")
+                    help="must match how the checkpoint was trained (the final weights used --drop-con); pass --no-drop-con to disable")
     p.add_argument("--no-drop-con", dest="drop_con", action="store_false")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--csv", type=Path, default=None, help="also write results to this CSV path")
@@ -148,19 +143,16 @@ def main():
 
     test_df = load_test_df(args.test_parquet)
     dataset = NimisMixtureParquetDataset(test_df)
+    collate_fn = functools.partial(collate128, K_max=args.K, noise_std=args.noise_std)
+    batches = list(DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn))
 
     rows = []
     n_comp_header = "".join(f"{f'acc ({c}-comp)':>16}" for c in n_component_bins)
     print(f"{'drop_frac':>10}{'accuracy':>12}{'peaks matched':>16}{n_comp_header}")
     for drop_frac in (float(f) for f in args.drop_fracs.split(",")):
-        generator = torch.Generator().manual_seed(args.seed)
-        collate_fn = functools.partial(
-            collate_with_j_dropout, K_max=args.K, noise_std=args.noise_std,
-            drop_frac=drop_frac, generator=generator,
-        )
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
         acc, match_rate, acc_per_n = evaluate_at_drop_frac(
-            model, loader, device, args.K, drop_con=args.drop_con, n_component_bins=n_component_bins,
+            model, batches, device, args.K, drop_frac, args.seed,
+            drop_con=args.drop_con, n_component_bins=n_component_bins,
         )
         per_n_str = "".join(f"{acc_per_n[c]*100:>15.2f}%" for c in n_component_bins)
         print(f"{drop_frac:>10.2f}{acc*100:>11.2f}%{match_rate*100:>15.2f}%{per_n_str}")

@@ -167,6 +167,7 @@ def build_conj_matrix(j_values, j_mask, tol=0.1):
 
             if np.any(diff <= tol):
                 conj[i, j] = 1.0
+    np.fill_diagonal(conj, 1.0)
     return conj
 
 
